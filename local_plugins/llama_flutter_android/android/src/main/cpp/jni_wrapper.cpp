@@ -1324,6 +1324,22 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
             break;
         }
 
+        // Plain path: feed the sampled token back so the next iteration
+        // samples from its logits instead of re-reading the prefill's.
+        if (!use_spec) {
+            batch.n_tokens = 0;
+            batch.token[batch.n_tokens] = new_token_id;
+            batch.pos[batch.n_tokens] = g_n_past;
+            batch.n_seq_id[batch.n_tokens] = 1;
+            batch.seq_id[batch.n_tokens][0] = 0;
+            batch.logits[batch.n_tokens] = true;
+            batch.n_tokens++;
+            if (llama_decode(g_ctx, batch) != 0) {
+                LOGE("Failed to decode token %d", new_token_id);
+                break;
+            }
+        }
+
         // Tokens confirmed by the target this iteration; the first is the
         // one sampled above, then verified drafts, then the target's own
         // bonus when every draft was accepted.
