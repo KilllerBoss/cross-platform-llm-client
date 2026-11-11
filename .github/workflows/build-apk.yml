@@ -24,7 +24,8 @@ jobs:
           channel: stable
           cache: true
 
-      - uses: android-actions/setup-android@v3
+      # The runner image ships the Android SDK with licenses pre-accepted;
+      # AGP auto-installs the NDK that flutter.ndkVersion asks for.
 
       # Optional: with the secrets RELEASE_KEYSTORE_B64 (base64 .jks),
       # RELEASE_KEYSTORE_PASSWORD, RELEASE_KEY_ALIAS and RELEASE_KEY_PASSWORD
