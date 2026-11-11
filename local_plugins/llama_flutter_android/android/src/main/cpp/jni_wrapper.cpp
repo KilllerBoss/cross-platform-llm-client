@@ -1318,8 +1318,19 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
     // Row of the last decode whose logits the next sample reads from
     // (-1 = last row; set explicitly after a speculative verify batch).
     int sample_row = -1;
+    // When a verify round accepted every draft, the target's bonus token is
+    // the next seed. It must NOT be decoded here: like llama-cli, it enters
+    // the KV as row 0 of the next verify batch. Decoding it now would leave
+    // a hole in the KV positions and crash the very next batch.
+    llama_token pending_seed = -1;
     for (int i = 0; i < max_tokens && !g_stop_flag;) {
-        llama_token new_token_id = llama_sampler_sample(g_sampler, g_ctx, sample_row);
+        llama_token new_token_id;
+        if (pending_seed >= 0) {
+            new_token_id = pending_seed;
+            pending_seed = -1;
+        } else {
+            new_token_id = llama_sampler_sample(g_sampler, g_ctx, sample_row);
+        }
         sample_row = -1;
 
         // Check for end of generation (EOS/EOD tokens)
@@ -1409,21 +1420,34 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
             if ((int)accepted.size() == k + 1) {
                 bonus = llama_sampler_sample(g_sampler, g_ctx, k);
                 if (llama_vocab_is_eog(g_vocab, bonus)) bonus = -1;
+                if (bonus >= 0) accepted.push_back(bonus);
             }
-            // Penalties must see every token that ends up in the reply, not
-            // just the ones the target sampled itself.
-            for (size_t j = 1; j < accepted.size(); j++) {
+            // Roll back the rejected draft rows. They were decoded into the
+            // KV, and the next batch starts at the last accepted position.
+            if ((int)accepted.size() <= k && bonus < 0) {
+                llama_memory_seq_rm(llama_get_memory(g_ctx), 0,
+                    g_n_past + (int32_t)accepted.size(), -1);
+            }
+            // Penalties must see the draft tokens the target confirmed; the
+            // seed and bonus went through llama_sampler_sample, which
+            // accepts what it samples.
+            const size_t n_to_accept = accepted.size() - (bonus >= 0 ? 1 : 0);
+            for (size_t j = 1; j < n_to_accept; j++) {
                 llama_sampler_accept(g_sampler, accepted[j]);
             }
-            common_speculative_accept(g_spec, 0,
-                (uint16_t)(accepted.size() + (bonus >= 0 ? 1 : 0)));
+            // Same count as llama-cli: drafts accepted, seed excluded.
+            common_speculative_accept(g_spec, 0, (uint16_t)(accepted.size() - 1));
         }
 
         // Emit this iteration's tokens; stop cleanly on EOG inside them.
+        // Accepted tokens are already in the KV; the bonus is not, so it
+        // only becomes the next round's seed (decoded with that batch).
         bool eog = false;
-        std::vector<llama_token> emitted = accepted;
-        if (bonus >= 0) emitted.push_back(bonus);
-        for (llama_token tok : emitted) {
+        if (use_spec && bonus >= 0) pending_seed = bonus;
+        // accepted ends with the bonus when one was sampled; it's emitted below
+        const size_t n_kv_tokens = accepted.size() - (bonus >= 0 ? 1 : 0);
+        for (size_t t = 0; t < n_kv_tokens; t++) {
+            const llama_token tok = accepted[t];
             if (llama_vocab_is_eog(g_vocab, tok)) { eog = true; break; }
 
             char buffer[256];
@@ -1438,11 +1462,21 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
             i++;
             if (g_cache_reusable) g_cached_tokens.push_back(tok);
         }
+        if (bonus >= 0) {
+            char buffer[256];
+            int32_t length = llama_token_to_piece(g_vocab, bonus, buffer, sizeof(buffer), 0, true);
+            std::string piece = length > 0 ? sanitizeUTF8(buffer, length) : "";
+
+            jstring token_str = env->NewStringUTF(piece.c_str());
+            env->CallObjectMethod(g_token_callback, invokeMethod, token_str);
+            env->DeleteLocalRef(token_str);
+            i++;
+        }
         if (eog) {
             LOGI("EOS token detected, ending generation.");
             break;
         }
-        if (use_spec) {
+        if (use_spec && pending_seed < 0) {
             // Sample next from the last accepted token's logits row.
             sample_row = (int)accepted.size() - 1;
         }
