@@ -811,7 +811,8 @@ class SettingsController extends GetxController {
         await LlamaCluster.setSpeculative(
             enabled: value,
             nDraft: _hive.getSetting<int>(AppConstants.keySpeculativeDraft,
-                defaultValue: 3));
+                    defaultValue: 3) ??
+                3);
       } catch (_) {
         // No native engine on this platform (web, iOS).
       }
