@@ -843,6 +843,10 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     // Model parameters
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
+    // qwen35/qwen35moe skip their NextN tensors unless this is set, and the
+    // MTP graph builder aborts on the missing weights — so it must match the
+    // speculative setting before the load, not after.
+    model_params.load_mtp = g_spec_enabled;
     // With no GPU layers requested, give llama.cpp an empty device list so
     // it can't touch a GPU at all (even if the Vulkan backend is loaded).
     static ggml_backend_dev_t no_gpu_devices[] = {nullptr};
