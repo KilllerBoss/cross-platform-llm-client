@@ -70,6 +70,17 @@ class ClusterWorkerService : Service() {
                 ?: JSONObject().put("state", "stopped")
 
         fun availableRamMb(context: Context): Long {
+            // availMem excludes the page cache, which Android always keeps
+            // full — so it reads ~30% low on an idle phone. MemAvailable is
+            // the kernel's own "allocatable without pressure" number and
+            // counts reclaimable cache.
+            try {
+                File("/proc/meminfo").forEachLine { line ->
+                    if (line.startsWith("MemAvailable:")) {
+                        return line.split(Regex("\\s+"))[1].toLong() / 1024
+                    }
+                }
+            } catch (_: Exception) { }
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             val info = ActivityManager.MemoryInfo()
             am.getMemoryInfo(info)
