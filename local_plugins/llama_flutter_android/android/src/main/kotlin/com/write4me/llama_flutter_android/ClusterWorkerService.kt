@@ -75,10 +75,9 @@ class ClusterWorkerService : Service() {
             // the kernel's own "allocatable without pressure" number and
             // counts reclaimable cache.
             try {
-                File("/proc/meminfo").forEachLine { line ->
-                    if (line.startsWith("MemAvailable:")) {
-                        return line.split(Regex("\\s+"))[1].toLong() / 1024
-                    }
+                val match = Regex("MemAvailable:\\s+(\\d+)").find(File("/proc/meminfo").readText())
+                if (match != null) {
+                    return match.groupValues[1].toLong() / 1024
                 }
             } catch (_: Exception) { }
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
