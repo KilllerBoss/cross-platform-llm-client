@@ -134,6 +134,10 @@ set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable tests")
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable examples")
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable server")
 
+# Speculative decoding / MTP drafts come from common/ (speculative.cpp);
+# examples and tools stay off, so only the library itself is built.
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "Build the common utils library" FORCE)
+
 # Multimodal (vision) support: build llama.cpp's mtmd library standalone,
 # without common/ or the CLI tools. Video needs an ffmpeg binary, which
 # Android doesn't have, so it stays off.
@@ -147,7 +151,7 @@ add_subdirectory(src/main/cpp/llama.cpp)
 # On Android/NDK it must explicitly link libc++ or symbols such as operator new
 # and std::runtime_error stay unresolved during the native build.
 if(ANDROID)
-    foreach(target ggml-base ggml ggml-cpu ggml-vulkan ggml-rpc llama mtmd
+    foreach(target ggml-base ggml ggml-cpu ggml-vulkan ggml-rpc llama mtmd llama-common
             ggml-cpu-android_armv8.0_1 ggml-cpu-android_armv8.2_1
             ggml-cpu-android_armv8.2_2 ggml-cpu-android_armv8.6_1
             ggml-cpu-android_armv9.0_1 ggml-cpu-android_armv9.2_1
@@ -158,7 +162,7 @@ if(ANDROID)
     endforeach()
 endif()
 
-# JNI wrapper library - simplified without common library
+# JNI wrapper library
 add_library(llama_jni SHARED
     src/main/cpp/jni_wrapper.cpp
 )
@@ -166,6 +170,7 @@ add_library(llama_jni SHARED
 target_link_libraries(llama_jni
     mtmd
     llama
+    llama-common
     ggml
     c++_shared
     android
@@ -180,4 +185,6 @@ endif()
 target_include_directories(llama_jni PRIVATE
     src/main/cpp/llama.cpp/include
     src/main/cpp/llama.cpp/ggml/include
+    src/main/cpp/llama.cpp/common
+    src/main/cpp/llama.cpp/src
 )

@@ -23,6 +23,8 @@
 #include "llama.cpp/include/llama.h"
 #include "llama.cpp/ggml/include/ggml-backend.h"
 #include "llama.cpp/ggml/include/gguf.h"
+#include "common.h"
+#include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #define LOG_TAG "LlamaJNI"
@@ -53,6 +55,71 @@ static bool g_capture_load_error = false;
 static std::string g_load_buffers;
 // Cluster worker: address of the master currently connected, empty if none.
 static std::string g_worker_peer;
+
+// Speculative decoding (MTP): the draft context runs the model's own NextN
+// head(s) next to the target context, so k tokens cost one target decode.
+// In the cluster that means one pass over the Wi-Fi pipeline per k tokens
+// instead of k passes. Null when the model has no MTP head or it's off.
+static common_speculative* g_spec = nullptr;
+static bool g_spec_enabled = false;
+static int g_n_draft = 3;
+static std::vector<llama_token> g_draft_result;
+static std::string g_model_path;
+static int64_t g_n_threads = 4;
+static bool g_cluster_active = false;
+// True while nativeGenerate runs: the speculative state must not be freed
+// (or rebuilt) under a live generation loop.
+static std::atomic<bool> g_in_generation{false};
+
+static void freeSpeculative() {
+    if (g_spec) {
+        common_speculative_free(g_spec);
+        g_spec = nullptr;
+    }
+}
+
+/// Builds the MTP draft context for the loaded model. Must run after the
+/// target context (and, in cluster mode, after the workers are registered)
+/// and after loadModel stored g_model_path/g_n_threads. Silent no-op when
+/// the model has no NextN head, so every model keeps working.
+static void initSpeculative() {
+    freeSpeculative();
+    if (!g_spec_enabled || !g_model || !g_ctx || g_model_path.empty()) return;
+    if (llama_model_n_layer_nextn(g_model) <= 0) {
+        LOGI("Speculative: model has no MTP (NextN) head");
+        return;
+    }
+    const auto types = common_speculative_types_from_gguf(g_model_path);
+    if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == types.end()) {
+        LOGI("Speculative: GGUF reports no MTP head");
+        return;
+    }
+
+    common_params params;
+    params.model.path = g_model_path;
+    params.n_ctx = llama_n_ctx(g_ctx);
+    params.n_batch = 512;
+    params.n_ubatch = 512;
+    params.cpuparams.n_threads = (int32_t)std::max<int64_t>(1, g_n_threads);
+    // The NextN weights are pinned to this phone's CPU (cluster tensor
+    // override), so the draft context must not push ops to a GPU or a worker.
+    params.no_op_offload = true;
+    params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+    params.speculative.draft.n_max = std::clamp(g_n_draft, 1, 8);
+    // mparams stay empty: init_from_params then builds the draft context from
+    // the target model itself (no weight reload; KV only for the NextN layers).
+    auto init = common_speculative_init_from_params(params, g_model, g_ctx);
+    if (!init || !init->context()) {
+        LOGE("Speculative: MTP draft context failed, decoding normally");
+        return;
+    }
+    params.speculative.draft.ctx_tgt = g_ctx;
+    params.speculative.draft.ctx_dft = init->context();
+    g_spec = common_speculative_init(params.speculative, 1);
+    if (g_spec) {
+        LOGI("Speculative: MTP ready, n_draft=%d", params.speculative.draft.n_max);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Runtime backend loading (GGML_BACKEND_DL)
@@ -333,9 +400,12 @@ static std::string planCluster(const char* model_path, ClusterPlan& plan) {
     // It's the biggest single matmul per token (vocab x hidden) and its
     // result, a score per vocab entry (~600 KB), would cross Wi-Fi on every
     // token. Keep its weights here instead (tied models reuse token_embd).
+    // The MTP (NextN) head stays local too: it drafts every token here and
+    // its hidden-state round trips can't afford Wi-Fi either.
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu) {
-        plan.overrides[0] = {"^(output|token_embd)\\.weight$", ggml_backend_dev_buffer_type(cpu)};
+        plan.overrides[0] = {"^(output|token_embd)\\.weight$|^blk\\.[0-9]+\\.nextn\\.",
+                             ggml_backend_dev_buffer_type(cpu)};
         plan.overrides[1] = {nullptr, nullptr};
     }
     LOGI("Cluster: %d of %d layers local, rest on %zu worker device(s), output layer local",
@@ -743,6 +813,8 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
         return;
     }
     LOGI("Loading model: %s", model_path);
+    g_model_path = model_path;
+    g_n_threads = n_threads;
 
     std::ifstream model_file(model_path, std::ios::binary | std::ios::ate);
     if (!model_file) {
@@ -790,6 +862,7 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
         std::lock_guard<std::mutex> lock(g_backend_mutex);
         has_cluster = !g_cluster_endpoints.empty();
     }
+    g_cluster_active = has_cluster;
     if (has_cluster) {
         const std::string error = planCluster(model_path, cluster);
         if (!error.empty()) {
@@ -842,6 +915,7 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     // Create context (using new API)
     g_ctx = llama_init_from_model(g_model, ctx_params);
     if (!g_ctx) {
+        freeSpeculative();
         llama_model_free(g_model);
         g_model = nullptr;
         jclass exception = env->FindClass("java/lang/RuntimeException");
@@ -854,6 +928,7 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     LOGI("Vocab initialized: %p", (void*)g_vocab);
     
     if (!g_vocab) {
+        freeSpeculative();
         llama_free(g_ctx);
         llama_model_free(g_model);
         g_ctx = nullptr;
@@ -883,6 +958,10 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     }
 
     LOGI("Model loaded successfully");
+
+    // After the target context and (in cluster mode) the workers are up:
+    // the MTP draft context sits on top of the already-loaded weights.
+    initSpeculative();
 }
 
 static void freeMtmd() {
@@ -1146,12 +1225,18 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
             env->ThrowNew(exception, "Failed to decode prompt");
             return;
         }
+        // Feed the MTP head: it captures the target's hidden states per
+        // prefill batch so it can draft right after the prompt.
+        if (g_spec && !common_speculative_process(g_spec, batch)) {
+            LOGE("Speculative: prefill process failed, drafting off this turn");
+        }
         tokens_processed += batch_size;
     }
 
     // The KV cache now holds exactly the prompt.
     g_n_past = (int)tokens.size();
     g_cached_tokens = tokens;
+    if (g_spec) common_speculative_begin(g_spec, 0, g_cached_tokens);
     }  // end text-only prompt path
 
     // Create sampler chain with all parameters
@@ -1222,8 +1307,16 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
 
     // Generation loop
     LOGI("Starting generation loop: max_tokens=%lld", max_tokens);
-    for (int i = 0; i < max_tokens && !g_stop_flag; i++) {
-        llama_token new_token_id = llama_sampler_sample(g_sampler, g_ctx, -1);
+    g_in_generation = true;
+    // Speculative drafting is text-only: image turns leave no token hidden
+    // states for the MTP head to chain from.
+    const bool use_spec = g_spec != nullptr && !with_image;
+    // Row of the last decode whose logits the next sample reads from
+    // (-1 = last row; set explicitly after a speculative verify batch).
+    int sample_row = -1;
+    for (int i = 0; i < max_tokens && !g_stop_flag;) {
+        llama_token new_token_id = llama_sampler_sample(g_sampler, g_ctx, sample_row);
+        sample_row = -1;
 
         // Check for end of generation (EOS/EOD tokens)
         if (llama_vocab_is_eog(g_vocab, new_token_id)) {
@@ -1231,41 +1324,111 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeGenera
             break;
         }
 
-        // Decode token to string
-        char buffer[256];
-        int32_t length = llama_token_to_piece(g_vocab, new_token_id, buffer, sizeof(buffer), 0, true);
-        std::string piece;
-        
-        if (length > 0) {
-            piece = sanitizeUTF8(buffer, length);
-        } else {
-            piece = "";
+        // Tokens confirmed by the target this iteration; the first is the
+        // one sampled above, then verified drafts, then the target's own
+        // bonus when every draft was accepted.
+        std::vector<llama_token> accepted = {new_token_id};
+        llama_token bonus = -1;
+
+        if (use_spec) {
+            // Draft with the MTP head. It builds on the hidden state the
+            // last process() captured (prefill's last batch or the previous
+            // verify batch), so drafting costs no target decode of its own.
+            g_draft_result.clear();
+            const int room = llama_n_ctx(g_ctx) - g_n_past - 1;
+            if (room >= 1) {
+                auto& dp = common_speculative_get_draft_params(g_spec, 0);
+                dp.drafting = true;
+                dp.n_max = std::min<int32_t>(g_n_draft, room);
+                dp.pos0 = g_n_past;
+                dp.id_last = new_token_id;
+                dp.prompt = &g_cached_tokens;
+                dp.result = &g_draft_result;
+                common_speculative_draft(g_spec);
+                dp.drafting = false;
+            }
+            int k = (int)g_draft_result.size();
+
+            // Verify seed + drafts in one batch. In the cluster the layers
+            // live on worker phones, so this single decode replaces k+1
+            // pipeline traversals.
+            batch.n_tokens = 0;
+            for (int j = 0; j <= k; j++) {
+                batch.token[batch.n_tokens] = j == 0 ? new_token_id : g_draft_result[j - 1];
+                batch.pos[batch.n_tokens] = g_n_past + j;
+                batch.n_seq_id[batch.n_tokens] = 1;
+                batch.seq_id[batch.n_tokens][0] = 0;
+                batch.logits[batch.n_tokens] = true;
+                batch.n_tokens++;
+            }
+            if (llama_decode(g_ctx, batch) != 0) {
+                LOGE("Failed to decode speculative batch of %d tokens", batch.n_tokens);
+                break;
+            }
+            if (!common_speculative_process(g_spec, batch)) {
+                LOGE("Speculative: verify process failed, drafting off this turn");
+                g_draft_result.clear();
+                k = 0;  // drafts can't be trusted against the cleared buffer
+            }
+
+            // Greedy verification: a draft survives while it matches the
+            // target's argmax at the position before it.
+            const int n_vocab = llama_vocab_n_tokens(g_vocab);
+            auto argmax = [&](int row) {
+                const float* logits = llama_get_logits_ith(g_ctx, row);
+                int best = 0;
+                for (int t = 1; t < n_vocab; t++) {
+                    if (logits[t] > logits[best]) best = t;
+                }
+                return (llama_token)best;
+            };
+            while ((int)accepted.size() <= k &&
+                   argmax((int)accepted.size() - 1) == g_draft_result[accepted.size() - 1]) {
+                accepted.push_back(g_draft_result[accepted.size() - 1]);
+            }
+            if ((int)accepted.size() == k + 1) {
+                bonus = llama_sampler_sample(g_sampler, g_ctx, k);
+                if (llama_vocab_is_eog(g_vocab, bonus)) bonus = -1;
+            }
+            // Penalties must see every token that ends up in the reply, not
+            // just the ones the target sampled itself.
+            for (size_t j = 1; j < accepted.size(); j++) {
+                llama_sampler_accept(g_sampler, accepted[j]);
+            }
+            common_speculative_accept(g_spec, 0,
+                (uint16_t)(accepted.size() + (bonus >= 0 ? 1 : 0)));
         }
-        
-        // Call Kotlin callback
-        jstring token_str = env->NewStringUTF(piece.c_str());
-        env->CallObjectMethod(g_token_callback, invokeMethod, token_str);
-        env->DeleteLocalRef(token_str);
 
-        // Prepare next batch
-        batch.n_tokens = 0;
-        batch.token[batch.n_tokens] = new_token_id;
-        batch.pos[batch.n_tokens] = g_n_past;  // Use the tracked position
-        batch.n_seq_id[batch.n_tokens] = 1;
-        batch.seq_id[batch.n_tokens][0] = 0;
-        batch.logits[batch.n_tokens] = true;
-        batch.n_tokens++;
+        // Emit this iteration's tokens; stop cleanly on EOG inside them.
+        bool eog = false;
+        std::vector<llama_token> emitted = accepted;
+        if (bonus >= 0) emitted.push_back(bonus);
+        for (llama_token tok : emitted) {
+            if (llama_vocab_is_eog(g_vocab, tok)) { eog = true; break; }
 
-        if (llama_decode(g_ctx, batch) != 0) {
-            LOGE("Failed to decode after sampling token %d", i + 1);
+            char buffer[256];
+            int32_t length = llama_token_to_piece(g_vocab, tok, buffer, sizeof(buffer), 0, true);
+            std::string piece = length > 0 ? sanitizeUTF8(buffer, length) : "";
+
+            jstring token_str = env->NewStringUTF(piece.c_str());
+            env->CallObjectMethod(g_token_callback, invokeMethod, token_str);
+            env->DeleteLocalRef(token_str);
+
+            g_n_past++;
+            i++;
+            if (g_cache_reusable) g_cached_tokens.push_back(tok);
+        }
+        if (eog) {
+            LOGI("EOS token detected, ending generation.");
             break;
         }
-        
-        // Update position counter after each generated token
-        g_n_past++;
-        if (g_cache_reusable) g_cached_tokens.push_back(new_token_id);
+        if (use_spec) {
+            // Sample next from the last accepted token's logits row.
+            sample_row = (int)accepted.size() - 1;
+        }
     }
     LOGI("Generation loop finished.");
+    g_in_generation = false;
 
     if (g_token_callback != nullptr) {
         env->DeleteGlobalRef(g_token_callback);
@@ -1287,6 +1450,27 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeStop(
     // When stopping generation, we just set the flag - KV cache management handled by llama.cpp
 }
 
+/// Enables/disables speculative MTP decoding and rebuilds the draft context.
+/// Takes effect immediately if a model is already loaded, otherwise on the
+/// next load. Returns the MTP layer count of the loaded model (0 if none).
+extern "C" JNIEXPORT jint JNICALL
+Java_com_write4me_llama_1flutter_1android_ClusterNative_nativeSetSpeculative(
+    JNIEnv* env, jobject thiz, jboolean enabled, jint n_draft) {
+    g_spec_enabled = enabled;
+    g_n_draft = std::clamp((int)n_draft, 1, 8);
+    // While a generation is running the draft context is in use; the new
+    // setting is picked up by the next model load instead.
+    if (!g_in_generation) initSpeculative();
+    return g_model ? llama_model_n_layer_nextn(g_model) : 0;
+}
+
+/// The loaded model's MTP (NextN) layer count, 0 when it has none.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_write4me_llama_1flutter_1android_ClusterNative_nativeGetNextnLayers(
+    JNIEnv* env, jobject thiz) {
+    return g_model ? llama_model_n_layer_nextn(g_model) : 0;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeFreeModel(
     JNIEnv* env, jobject thiz) {
@@ -1295,6 +1479,7 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeFreeMo
         llama_sampler_free(g_sampler);
         g_sampler = nullptr;
     }
+    freeSpeculative();
     freeMtmd();
     g_cache_reusable = true;
     if (g_ctx) {

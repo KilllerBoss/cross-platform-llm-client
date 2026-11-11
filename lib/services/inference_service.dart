@@ -6,6 +6,7 @@ import 'device_info_service.dart';
 import 'app_log_service.dart';
 import 'cluster_service.dart';
 import 'stop_sequence_filter.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart';
 
 // Conditionally import llama_flutter_android — only on Android
 import 'inference_android.dart' if (dart.library.html) 'inference_stub.dart'
@@ -45,6 +46,15 @@ class InferenceService extends GetxService {
   final loadedModelRuntime = ''.obs;
   final loadedBackend = ''.obs;
 
+  /// MTP (NextN) layer count of the loaded GGUF; 0 = no drafting. Speculative
+  /// decoding is active when this is > 0 and the setting is on — in the
+  /// phone cluster it cuts Wi-Fi pipeline trips per token by the draft count.
+  final mtpLayers = 0.obs;
+
+  /// Whether speculative drafting was actually applied to the loaded model.
+  final speculativeDrafting = false.obs;
+  bool get mtpActive => mtpLayers.value > 0 && speculativeDrafting.value;
+
   /// Whether the current platform supports local inference.
   bool get supportsLocalInference => platform.supportsLocalInference;
 
@@ -56,6 +66,23 @@ class InferenceService extends GetxService {
 
   /// The loaded GGUF model has a working vision projector (images allowed).
   bool get ggufVisionLoaded => _engine?.ggufVisionLoaded ?? false;
+
+  /// Hands the speculative MTP setting to the native engine before a GGUF
+  /// load; the draft context is then built at the end of the load itself.
+  /// Errors (web, iOS, older plugin) leave normal decoding in place.
+  Future<void> _applySpeculative() async {
+    final enabled =
+        _hive.getSetting<bool>(AppConstants.keySpeculativeEnabled) ?? false;
+    try {
+      await LlamaCluster.setSpeculative(
+        enabled: enabled,
+        nDraft: _hive.getSetting<int>(AppConstants.keySpeculativeDraft) ?? 3,
+      );
+      speculativeDrafting.value = enabled;
+    } catch (_) {
+      speculativeDrafting.value = false;
+    }
+  }
 
   Future<String> loadModel(
     String modelPath, {
@@ -139,6 +166,11 @@ class InferenceService extends GetxService {
             .applyForNextLoad(modelPath, modelName: modelName);
       }
 
+      mtpLayers.value = 0;
+      if (!isLiteRt) {
+        await _applySpeculative();
+      }
+
       final requestedModelName = modelName ?? modelPath.split('/').last;
       var activeModelName = requestedModelName;
       var result = await _loadModelOnEngine(
@@ -201,6 +233,12 @@ class InferenceService extends GetxService {
 
       if (isLiteRt) {
         await _hive.setSetting('last_loaded_context_size', finalContextSize);
+      } else {
+        try {
+          mtpLayers.value = await LlamaCluster.nextnLayers();
+        } catch (_) {
+          mtpLayers.value = 0;
+        }
       }
 
       if (clusterWorkers > 0) {
@@ -221,6 +259,8 @@ class InferenceService extends GetxService {
   }
 
   Future<void> unloadModel() async {
+    mtpLayers.value = 0;
+    speculativeDrafting.value = false;
     final engine = _engine;
     _engine = null;
     if (Get.isRegistered<ClusterService>()) {

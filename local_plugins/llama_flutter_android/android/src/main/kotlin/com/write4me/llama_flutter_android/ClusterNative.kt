@@ -33,6 +33,16 @@ object ClusterNative {
     external fun nativeMemBandwidth(threads: Int): Double
 
     /**
+     * Turns speculative MTP decoding on/off and rebuilds the draft context.
+     * Takes effect on the next load, or right away if a model is loaded.
+     * Returns the loaded model's MTP layer count (0 = no MTP head).
+     */
+    external fun nativeSetSpeculative(enabled: Boolean, nDraft: Int): Int
+
+    /** The loaded model's MTP (NextN) layer count; 0 when it has none. */
+    external fun nativeGetNextnLayers(): Int
+
+    /**
      * Fast cores this process may run on. A foreground service only gets
      * some of the cores (e.g. 4 little + 2 big on a Snapdragon 845), and
      * ggml threads wait for each other every step, so use one thread per

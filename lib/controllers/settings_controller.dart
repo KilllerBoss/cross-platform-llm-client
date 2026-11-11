@@ -10,7 +10,9 @@ import '../core/haptics.dart';
 import '../core/ui.dart';
 import '../services/hive_service.dart';
 import '../services/app_log_service.dart';
+import '../services/inference_service.dart';
 import '../services/local_image_service.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart';
 import '../ffi/sd_ffi_bindings.dart';
 import 'package:sd_flutter_android/sd_flutter_android.dart';
 
@@ -60,6 +62,9 @@ class SettingsController extends GetxController {
   final fontScale = AppConstants.defaultFontScale.obs;
   final hapticsEnabled = true.obs;
   final appVersion = ''.obs;
+
+  /// Speculative MTP drafting (GGUF models with a NextN head).
+  final speculativeEnabled = false.obs;
 
   // Persistent text controllers for settings fields
   final openaiKeyController = TextEditingController();
@@ -239,6 +244,10 @@ class SettingsController extends GetxController {
             defaultValue: true) ??
         true;
     Haptics.enabled = hapticsEnabled.value;
+    speculativeEnabled.value = _hive.getSetting<bool>(
+            AppConstants.keySpeculativeEnabled,
+            defaultValue: false) ??
+        false;
 
     // Sync controllers with loaded values
     openaiKeyController.text = openaiKey.value;
@@ -790,6 +799,23 @@ class SettingsController extends GetxController {
     // A little confirmation tick when turning it on.
     Haptics.selectionClick();
     await _hive.setSetting(AppConstants.keyHapticsEnabled, value);
+  }
+
+  Future<void> setSpeculativeEnabled(bool value) async {
+    speculativeEnabled.value = value;
+    await _hive.setSetting(AppConstants.keySpeculativeEnabled, value);
+    // Apply to an already-loaded model right away; otherwise it takes
+    // effect on the next load.
+    if (Get.isRegistered<InferenceService>()) {
+      try {
+        await LlamaCluster.setSpeculative(
+            enabled: value,
+            nDraft: _hive.getSetting<int>(AppConstants.keySpeculativeDraft,
+                defaultValue: 3));
+      } catch (_) {
+        // No native engine on this platform (web, iOS).
+      }
+    }
   }
 
   Future<void> setFontScale(double value) async {

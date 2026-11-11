@@ -126,6 +126,24 @@ class SettingsView extends GetView<SettingsController> {
                   chevron: true,
                   onTap: () => Get.to(() => const ClusterView()),
                 ),
+              if (ClusterService.canBeMaster)
+                Obx(() {
+                  final inf = Get.find<InferenceService>();
+                  final hasMtp = inf.mtpLayers.value > 0;
+                  return AppRow(
+                    icon: Icons.bolt_outlined,
+                    title: 'MTP drafting',
+                    subtitle: hasMtp
+                        ? 'Speculative decoding — ${inf.mtpLayers.value} draft token(s) per step'
+                        : 'Speculative decoding — needs a model with an MTP (NextN) head',
+                    trailing: Switch(
+                      value: controller.speculativeEnabled.value,
+                      onChanged: controller.setSpeculativeEnabled,
+                    ),
+                    onTap: () => controller
+                        .setSpeculativeEnabled(!controller.speculativeEnabled.value),
+                  );
+                }),
             ]),
             const SectionHeader('About'),
             AppGroup(dividerIndent: 60, children: [

@@ -177,6 +177,13 @@ class ClusterChannel(
                     result.success(null)
                 }
             }
+            "setSpeculative" -> scope.launch(Dispatchers.IO) {
+                val nextn = ClusterNative.nativeSetSpeculative(
+                    call.argument<Boolean>("enabled") == true,
+                    call.argument<Int>("nDraft") ?: 3)
+                withContext(Dispatchers.Main) { result.success(nextn) }
+            }
+            "getNextnLayers" -> result.success(ClusterNative.nativeGetNextnLayers())
             else -> result.notImplemented()
         }
     }

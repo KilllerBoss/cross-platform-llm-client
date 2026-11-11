@@ -143,6 +143,17 @@ class LlamaCluster {
   static Future<double> benchmark() async =>
       await _channel.invokeMethod<double>('benchmark') ?? 0;
 
+  /// Turns speculative MTP decoding on/off. Returns the loaded model's MTP
+  /// (NextN) layer count — 0 when the model can't draft or none is loaded.
+  /// Applies to the next model load as well.
+  static Future<int> setSpeculative({required bool enabled, int nDraft = 3}) async =>
+      await _channel.invokeMethod<int>(
+          'setSpeculative', {'enabled': enabled, 'nDraft': nDraft}) ?? 0;
+
+  /// The loaded model's MTP (NextN) layer count, 0 when it has none.
+  static Future<int> nextnLayers() async =>
+      await _channel.invokeMethod<int>('getNextnLayers') ?? 0;
+
   /// Where the last model load put its weights: llama.cpp buffer name
   /// ("CPU_Mapped", "RPC0[host:port]", …) and size in MB.
   static Future<List<({String name, double mb})>> lastLoadBuffers() async {

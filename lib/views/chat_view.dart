@@ -259,6 +259,7 @@ class ChatView extends GetView<ChatController> {
                   (inf.isGpuAccelerated.value ? 'GPU' : 'CPU')
               : (inf.isGpuAccelerated.value ? 'GPU' : 'CPU'),
           inf.loadedModelRuntime.value == 'litert' ? 'LiteRT' : 'GGUF',
+          if (inf.mtpActive) 'MTP×${inf.mtpLayers.value}',
         ].join(' · '),
         dot: green,
         canUnload: true,
